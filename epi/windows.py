@@ -63,12 +63,20 @@
 
 from collections import defaultdict
 from fractions import Fraction
+import logging
 from pathlib import Path
 
 import numpy as np
 from scipy.signal import resample_poly
 
 from .reader import NicoletEReader
+
+logger = logging.getLogger(__name__)
+
+
+class WindowReadError(RuntimeError):
+    """Ридер не смог вернуть полное окно запрошенной формы."""
+
 
 # 19 электродов схемы 10-20, общие для всех записей коллекции
 CANONICAL = [
@@ -480,8 +488,24 @@ class WindowSet:
         """Прочитать одно окно как массив (каналы, отсчёты) типа float32."""
         reader = self._reader(window["recording_id"])
         reader.select_segment(window["segment"])
-        data = reader.read(self.channels, start_sec=window["start_sec"],
-                           duration_sec=window["length_sec"])
+        try:
+            data = reader.read(self.channels, start_sec=window["start_sec"],
+                               duration_sec=window["length_sec"])
+        except (IndexError, OSError, EOFError, ValueError) as error:
+            # ValueError бывает и при усечённом блоке: pynicolet пытается
+            # записать меньше отсчётов, чем ожидалось, в свой выходной массив.
+            raise WindowReadError(str(error)) from error
+        if data.ndim != 2 or data.shape[1] != len(self.channels):
+            raise WindowReadError(
+                "expected (samples, %d channels), got %s"
+                % (len(self.channels), data.shape)
+            )
+        expected_source = int(round(window["length_sec"] * reader.sampling_rate))
+        if data.shape[0] < expected_source or data.shape[0] == 0:
+            raise WindowReadError(
+                "incomplete window: expected %d samples at %g Hz, got %d"
+                % (expected_source, reader.sampling_rate, data.shape[0])
+            )
         if reader.sampling_rate != self.rate:
             # дробь из двух частот, а не из их частного: частное -- двоичное
             # число с плавающей точкой, точное отношение которого имеет
@@ -489,6 +513,11 @@ class WindowSet:
             ratio = Fraction(int(self.rate), int(reader.sampling_rate))
             data = resample_poly(data, ratio.numerator, ratio.denominator, axis=0)
         expected = int(round(window["length_sec"] * self.rate))
+        if data.shape[0] < expected:
+            raise WindowReadError(
+                "incomplete window: expected %d samples at %g Hz, got %d"
+                % (expected, self.rate, data.shape[0])
+            )
         return data[:expected].T.astype(np.float32)
 
     @staticmethod
@@ -501,7 +530,8 @@ class WindowSet:
                OR (lag_sec IS NOT NULL AND lag_sec <= ?))"""
 
     def sample(self, fold="train", n=1000, positive_ratio=0.5, hard_ratio=0.0,
-               hard_span_sec=600.0, seed=0, max_flat=0.01, verbose=True):
+               hard_span_sec=600.0, seed=0, max_flat=0.01, verbose=True,
+               return_groups=False):
         """Собрать сбалансированную выборку окон в память.
 
         Классы набираются по отдельности, каждый до своей квоты, иначе редкие
@@ -522,6 +552,13 @@ class WindowSet:
         фоном -- размер выборки от настроек не зависит.
 
         Возвращает (x, y): x формы (окна, каналы, отсчёты), y -- метки 0/1.
+        При return_groups=True возвращает (x, y, groups), где groups[i] --
+        patient_key окна x[i], с учётом отбраковки и перемешивания. Это группы
+        для patient_folds() / patient_cv(); для CV берите только fold="train".
+
+        Ошибки чтения отдельных окон пропускаются с WARNING и traceback в
+        логгере epi.windows, в том числе при verbose=False. Неполные окна
+        тоже считаются ошибкой чтения, а не дополняются нулями.
         """
         generator = np.random.default_rng(seed)
         band = (self.gap_before_sec + hard_span_sec,
@@ -533,7 +570,8 @@ class WindowSet:
                 where += " AND %s%s" % ("" if hard else "NOT ", self.NEAR)
                 params += list(band)
             rows = self.conn.execute(
-                """SELECT windows.* FROM windows
+                """SELECT windows.*, recordings.patient_key, recordings.rel_path
+                   FROM windows
                    JOIN recordings ON recordings.id = windows.recording_id
                    JOIN splits USING (patient_key)
                    WHERE %s""" % where, params,
@@ -542,23 +580,32 @@ class WindowSet:
 
         def fill(label, quota, hard=None):
             chosen, flat, unreadable = [], 0, 0
-        
+
             for window in candidates(label, hard):
                 if len(chosen) >= quota:
                     break
-        
+
                 try:
                     data = self.load(window)
-                except IndexError:
+                except (WindowReadError, IndexError, OSError, EOFError) as error:
                     unreadable += 1
+                    logger.warning(
+                        "Skipping unreadable window: fold=%s window_id=%s "
+                        "recording_id=%s path=%r segment=%s start_sec=%s "
+                        "length_sec=%s label=%s channels=%s target_rate=%s; %s: %s",
+                        fold, window["id"], window["recording_id"], window["rel_path"],
+                        window["segment"], window["start_sec"], window["length_sec"],
+                        window["label"], self.channels, self.rate,
+                        type(error).__name__, error, exc_info=True,
+                    )
                     continue
-        
+
                 if self.flat_fraction(data) > max_flat:
                     flat += 1
                     continue
-        
-                chosen.append(data)
-        
+
+                chosen.append((data, window["patient_key"]))
+
             return chosen, flat, unreadable
 
         wanted_positive = int(round(n * positive_ratio))
@@ -566,7 +613,7 @@ class WindowSet:
         wanted_hard = int(round(wanted_negative * hard_ratio))
 
         positives, dropped, unreadable = fill(1, wanted_positive)
-        
+
         if wanted_hard:
             hard, dropped_hard, unreadable_hard = fill(
                 0, wanted_hard, hard=True
@@ -582,36 +629,50 @@ class WindowSet:
         negatives = hard + easy
 
         kept = positives + negatives
+        total_flat = dropped + dropped_hard + dropped_easy
+        total_unreadable = unreadable + unreadable_hard + unreadable_easy
         if not kept:
-            raise ValueError("после отсева плоского сигнала не осталось ни одного окна")
+            raise ValueError(
+                "%s: не осталось ни одного окна; плоских %d, ошибок чтения %d"
+                % (fold, total_flat, total_unreadable)
+            )
+        if len(kept) < n:
+            logger.warning(
+                "%s: requested %d windows (%d positive), kept %d (%d positive); "
+                "flat=%d, unreadable=%d; candidate windows exhausted",
+                fold, n, wanted_positive, len(kept), len(positives),
+                total_flat, total_unreadable,
+            )
         labels = [1] * len(positives) + [0] * len(negatives)
 
         order = generator.permutation(len(kept))
-        x = np.stack([kept[i] for i in order])
+        x = np.stack([kept[i][0] for i in order])
         y = np.array([labels[i] for i in order])
 
         if verbose:
             print("%s: %d окон (%d %s), отброшено плоских %d ошибок чтения %d"
                   % (fold, len(y), int(y.sum()), self.positive_name,
-                     dropped + dropped_hard + dropped_easy, 
-                     unreadable + unreadable_hard + unreadable_easy))
+                     total_flat, total_unreadable))
             if wanted_hard:
                 print("   из фона трудных %d из %d: не дальше %.0f с до и %.0f с "
                       "после приступа" % (len(hard), len(negatives), band[0], band[1]))
             print("   форма %s при %g Гц" % (x.shape, self.rate))
+        if return_groups:
+            return x, y, np.array([kept[i][1] for i in order])
         return x, y
 
     def export(self, fold="train", out_dir="training", **kwargs):
         """Сохранить выборку фолда в файл .npz.
 
-        Внутри лежат x, y, channels и rate. Остальные аргументы такие же,
-        как у sample().
+        Внутри лежат x, y, groups (patient_key каждого окна), channels и rate.
+        Остальные аргументы такие же, как у sample(); groups сохраняются всегда.
         """
-        x, y = self.sample(fold=fold, **kwargs)
+        kwargs["return_groups"] = True
+        x, y, groups = self.sample(fold=fold, **kwargs)
         out_dir = Path(out_dir)
         out_dir.mkdir(exist_ok=True)
         path = out_dir / ("%s.npz" % fold)
-        np.savez_compressed(path, x=x, y=y,
+        np.savez_compressed(path, x=x, y=y, groups=groups,
                             channels=np.array(self.channels), rate=self.rate)
         print("записано в %s" % path)
         return path

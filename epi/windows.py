@@ -531,7 +531,7 @@ class WindowSet:
 
     def sample(self, fold="train", n=1000, positive_ratio=0.5, hard_ratio=0.0,
                hard_span_sec=600.0, seed=0, max_flat=0.01, verbose=True,
-               return_groups=False):
+               return_groups=False, return_metadata=False):
         """Собрать сбалансированную выборку окон в память.
 
         Классы набираются по отдельности, каждый до своей квоты, иначе редкие
@@ -552,9 +552,10 @@ class WindowSet:
         фоном -- размер выборки от настроек не зависит.
 
         Возвращает (x, y): x формы (окна, каналы, отсчёты), y -- метки 0/1.
-        При return_groups=True возвращает (x, y, groups), где groups[i] --
-        patient_key окна x[i], с учётом отбраковки и перемешивания. Это группы
-        для patient_folds() / patient_cv(); для CV берите только fold="train".
+        При return_groups=True возвращает patient_key каждого окна.
+        При return_metadata=True возвращает список словарей с window_id,
+        recording_id, patient_key, segment, start_sec, length_sec, overlap_sec,
+        lead_sec, lag_sec и event_idx. Оба флага можно использовать вместе.
 
         Ошибки чтения отдельных окон пропускаются с WARNING и traceback в
         логгере epi.windows, в том числе при verbose=False. Неполные окна
@@ -577,6 +578,22 @@ class WindowSet:
                    WHERE %s""" % where, params,
             ).fetchall()
             return [rows[i] for i in generator.permutation(len(rows))]
+
+        def metadata(window):
+            return {
+                "window_id": window["id"],
+                "recording_id": window["recording_id"],
+                "patient_key": window["patient_key"],
+                "rel_path": window["rel_path"],
+                "segment": window["segment"],
+                "start_sec": window["start_sec"],
+                "length_sec": window["length_sec"],
+                "overlap_sec": window["overlap_sec"],
+                "lead_sec": window["lead_sec"],
+                "lag_sec": window["lag_sec"],
+                "event_idx": window["event_idx"],
+                "label": window["label"],
+            }
 
         def fill(label, quota, hard=None):
             chosen, flat, unreadable = [], 0, 0
@@ -604,7 +621,7 @@ class WindowSet:
                     flat += 1
                     continue
 
-                chosen.append((data, window["patient_key"]))
+                chosen.append((data, window["patient_key"], metadata(window)))
 
             return chosen, flat, unreadable
 
@@ -657,8 +674,14 @@ class WindowSet:
                 print("   из фона трудных %d из %d: не дальше %.0f с до и %.0f с "
                       "после приступа" % (len(hard), len(negatives), band[0], band[1]))
             print("   форма %s при %g Гц" % (x.shape, self.rate))
+        groups = np.array([kept[i][1] for i in order])
+        metadata_rows = [kept[i][2] for i in order]
+        if return_groups and return_metadata:
+            return x, y, groups, metadata_rows
         if return_groups:
-            return x, y, np.array([kept[i][1] for i in order])
+            return x, y, groups
+        if return_metadata:
+            return x, y, metadata_rows
         return x, y
 
     def export(self, fold="train", out_dir="training", **kwargs):
@@ -667,6 +690,7 @@ class WindowSet:
         Внутри лежат x, y, groups (patient_key каждого окна), channels и rate.
         Остальные аргументы такие же, как у sample(); groups сохраняются всегда.
         """
+        kwargs.pop("return_metadata", None)
         kwargs["return_groups"] = True
         x, y, groups = self.sample(fold=fold, **kwargs)
         out_dir = Path(out_dir)

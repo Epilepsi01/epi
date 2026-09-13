@@ -12,6 +12,8 @@ BANDS = (
     ("gamma", 30.0, 40.0),
 )
 
+BANDS_70 = BANDS + (("high_gamma", 40.0, 70.0),)
+
 
 def _eeg(x):
     x = np.asarray(x)
@@ -77,10 +79,12 @@ def entropy(x, rate, low=0.5, high=40.0, nperseg=None):
     return float(value[0]) if single else value
 
 
-def eeg_features(x, rate, lags_sec=None):
+def eeg_features(x, rate, lags_sec=None, bands=BANDS, entropy_low=0.5,
+                 entropy_high=None):
     acf_values, lags = acf(x, rate, lags_sec=lags_sec)
-    spectral_values, spectral_names = spectral(x, rate)
-    entropy_values = entropy(x, rate)
+    spectral_values, spectral_names = spectral(x, rate, bands=bands)
+    entropy_high = bands[-1][2] if entropy_high is None else entropy_high
+    entropy_values = entropy(x, rate, low=entropy_low, high=entropy_high)
 
     single = np.asarray(x).ndim == 2
     if single:

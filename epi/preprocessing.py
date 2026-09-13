@@ -53,6 +53,82 @@ def normalize(x, method="robust", eps=1e-8, clip=None):
     return out.astype(np.float32)
 
 
+
+def rereference(x, method="car"):
+    x = _array(x)
+    if method in (None, "none"):
+        return x.astype(np.float32)
+    if method == "car":
+        ref = np.mean(x, axis=-2, keepdims=True)
+    elif method == "median":
+        ref = np.median(x, axis=-2, keepdims=True)
+    else:
+        raise ValueError("method must be 'car', 'median' or None")
+    return (x - ref).astype(np.float32)
+
+
+def _group_stats(x, method="robust", eps=1e-8):
+    if method == "robust":
+        center = np.median(x, axis=(0, 2))
+        scale = np.median(np.abs(x - center[None, :, None]), axis=(0, 2)) * 1.4826
+    elif method == "zscore":
+        center = np.mean(x, axis=(0, 2))
+        scale = np.std(x, axis=(0, 2))
+    else:
+        raise ValueError("method must be 'robust' or 'zscore'")
+    return center.astype(np.float64), np.maximum(scale, eps).astype(np.float64)
+
+
+def fit_group_normalizer(x, groups, method="robust", eps=1e-8):
+    x = np.asarray(x)
+    if x.ndim != 3:
+        raise ValueError("expected (windows, channels, samples)")
+    groups = np.asarray(groups, dtype=object)
+    if groups.ndim != 1 or len(groups) != len(x):
+        raise ValueError("groups must contain one value per window")
+
+    stats = {}
+    for group in dict.fromkeys(groups.tolist()):
+        mask = groups == group
+        center, scale = _group_stats(x[mask], method=method, eps=eps)
+        stats[group] = {"center": center, "scale": scale}
+    return {"method": method, "eps": eps, "channels": x.shape[1], "groups": stats}
+
+
+def normalize_grouped(x, groups, stats, clip=None):
+    x = np.asarray(x)
+    if x.ndim != 3:
+        raise ValueError("expected (windows, channels, samples)")
+    groups = np.asarray(groups, dtype=object)
+    if groups.ndim != 1 or len(groups) != len(x):
+        raise ValueError("groups must contain one value per window")
+    if stats.get("channels") != x.shape[1]:
+        raise ValueError("normalizer channel count does not match x")
+
+    out = np.empty_like(x, dtype=np.float32)
+    fitted = stats["groups"]
+    for group in dict.fromkeys(groups.tolist()):
+        if group not in fitted:
+            raise KeyError("missing normalization statistics for group %r" % (group,))
+        mask = groups == group
+        center = fitted[group]["center"].astype(np.float32)[None, :, None]
+        scale = fitted[group]["scale"].astype(np.float32)[None, :, None]
+        out[mask] = (x[mask].astype(np.float32, copy=False) - center) / scale
+    if clip is not None:
+        out = np.clip(out, -clip, clip)
+    return out.astype(np.float32)
+
+
+def preprocess_grouped(x, groups, rate, low=0.5, high=40.0, notch_freq=50.0,
+                       reference=None, normalize_method="robust", clip=None,
+                       order=4):
+    x = preprocess(
+        x, rate, low=low, high=high, notch_freq=notch_freq,
+        normalize_signal=False, reference=reference, order=order,
+    )
+    stats = fit_group_normalizer(x, groups, method=normalize_method)
+    return normalize_grouped(x, groups, stats, clip=clip), stats
+
 def quality(x, flat_eps=1e-6, bad_low=0.1, bad_high=10.0):
     single = np.asarray(x).ndim == 2
     x = _array(x)
@@ -229,9 +305,11 @@ def clean_mask(x, max_flat=0.01, max_amplitude_uv=1000.0, max_jump_uv=250.0,
 
 
 def preprocess(x, rate, low=0.5, high=40.0, notch_freq=50.0, normalize_signal=False,
-               normalize_method="robust", clip=None):
+               normalize_method="robust", clip=None, reference=None, order=4):
     x = notch(x, rate, notch_freq)
-    x = bandpass(x, rate, low, high)
+    x = bandpass(x, rate, low, high, order=order)
+    if reference is not None:
+        x = rereference(x, method=reference)
     if normalize_signal:
         x = normalize(x, method=normalize_method, clip=clip)
     return x

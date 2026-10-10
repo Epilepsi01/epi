@@ -3,15 +3,30 @@
 # GUID и даты рождения пациентов, фамилии, заметки врачей.
 *.e
 *.rar
+# data/archives/epi_data.zip хранится только локально и тоже исключён из Git.
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
 *.npa
+*.npy
+*.npz
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+data/
+epi_data/
 тест/
 вторые девять/
-catalog.sqlite
-catalog.sqlite-journal
+F/
 digest.json
 training/
 plots/
-*.npz
+*.log
 
 # Служебное
 .venv/
@@ -22,3 +37,9 @@ build/
 dist/
 *.egg-info/
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store

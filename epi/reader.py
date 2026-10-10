@@ -209,6 +209,7 @@ class NicoletEReader:
         self._header = self._reader.read_header()
         self._events_backend = None
         self._merged = None
+        self._packet_indices = {}
 
         raw_segments = self._header["Segments"]
         origin = _to_datetime(raw_segments[0]["startDate"], raw_segments[0]["startTime"])
@@ -225,6 +226,7 @@ class NicoletEReader:
         # pynicolet оставляет только каналы с преобладающей частотой;
         # столбец i из read_data() -- это канал matching[i] записи
         matching = list(self._header["matchingChannels"])
+        self._source_channels = matching
         self.channels = [first["chName"][i].strip() for i in matching]
         self.references = [first["refName"][i].strip() for i in matching]
         self.excluded = [
@@ -292,6 +294,12 @@ class NicoletEReader:
         )
 
     def _sample_range(self, start_sec, duration_sec):
+        if not np.isfinite(start_sec):
+            raise ValueError("start_sec must be finite")
+        if duration_sec is not None and (
+            not np.isfinite(duration_sec) or duration_sec <= 0
+        ):
+            raise ValueError("duration_sec must be positive and finite")
         start = int(round(start_sec * self.sampling_rate))
         if start < 0 or start >= self.n_samples:
             raise ValueError(
@@ -304,6 +312,8 @@ class NicoletEReader:
             stop = min(
                 start + int(round(duration_sec * self.sampling_rate)), self.n_samples
             )
+        if stop <= start:
+            raise ValueError("requested interval contains no samples")
         # pynicolet ждёт диапазон [первый, последний] с нумерацией от единицы
         return [start + 1, stop]
 
@@ -312,24 +322,93 @@ class NicoletEReader:
 
         duration_sec=None читает сегмент до конца.
         """
-        data = self._reader.read_data(
-            segment=self.segment,
-            chIdx=[self._index(name)],
-            range_=self._sample_range(start_sec, duration_sec),
-        )
-        return data[:, 0]
+        return self.read([name], start_sec, duration_sec)[:, 0]
+
+    def _channel_calibration(self, source):
+        """Калибровка физического канала, а не его позиции в self.channels."""
+        segments = self._header["Segments"]
+        name = segments[0]["chName"][source]
+        # Нельзя складывать отсчёты разных каналов/частот в один поток.
+        # Такой файл требует отдельной поддержки смены монтажа.
+        for segment in segments[:self.segment + 1]:
+            if (source >= len(segment["chName"])
+                    or segment["chName"][source] != name
+                    or segment["samplingRate"][source] != self.sampling_rate):
+                raise ValueError("channel layout/rate changes between segments")
+        gain = float(segments[self.segment]["scale"][source])
+        info = self._header["tsInfos"][self.segment][source]
+        offset = float(info["dEegOffset"])
+        if not np.isfinite(gain) or gain == 0 or not np.isfinite(offset):
+            raise ValueError("invalid channel calibration")
+        return gain, offset
+
+    def channel_limits(self, name):
+        """Пределы int16 АЦП в мкВ для QC ДО ресэмплинга и фильтрации."""
+        source = self._source_channels[self._index(name)]
+        gain, offset = self._channel_calibration(source)
+        return tuple(sorted((-32768 * gain + offset, 32767 * gain + offset)))
+
+    def _packet_index(self, source):
+        if source not in self._packet_indices:
+            tags = {p["tag"]: p["index"] for p in self._header["StaticPackets"]}
+            if str(source) not in tags:
+                raise ValueError("channel has no data packet index")
+            entries = self._header["MainIndex"][
+                self._header["allIndexIDs"] == tags[str(source)]
+            ]
+            sizes = np.asarray(entries["sectionL"], dtype=np.int64)
+            if len(sizes) == 0 or np.any(sizes < 0) or np.any(sizes % 2):
+                raise ValueError("missing or malformed int16 channel packets")
+            offsets = np.concatenate(([0], np.cumsum(sizes // 2)))
+            if np.any(np.diff(offsets) < 0):
+                raise ValueError("channel packet offsets overflow")
+            self._packet_indices[source] = entries, offsets
+        return self._packet_indices[source]
 
     def read(self, names=None, start_sec=0.0, duration_sec=None):
         """Вернуть несколько каналов массивом (отсчёты, каналы) в микровольтах.
 
         names=None читает все каналы основного потока в их исходном порядке.
         """
-        idx = None if names is None else [self._index(n) for n in names]
-        return self._reader.read_data(
-            segment=self.segment,
-            chIdx=idx,
-            range_=self._sample_range(start_sec, duration_sec),
-        )
+        indices = (range(len(self.channels)) if names is None
+                   else [self._index(n) for n in names])
+        sources = [self._source_channels[i] for i in indices]
+        first, last = self._sample_range(start_sec, duration_sec)
+        count = last - first + 1
+        # В файле каждый канал хранится как последовательность пакетов.
+        # Разрывы реального времени не содержат отсчётов. Смещение сегмента
+        # прибавляется ровно один раз, включая позицию внутри пакета.
+        skip = int(round(sum(s.duration_sec for s in self.segments[:self.segment])
+                         * self.sampling_rate))
+        start, stop = skip + first - 1, skip + last
+        out = np.empty((count, len(sources)), dtype=np.float64)
+        tasks = []
+        for column, source in enumerate(sources):
+            gain, offset = self._channel_calibration(source)
+            entries, offsets = self._packet_index(source)
+            if stop > offsets[-1]:
+                raise EOFError("channel packets do not cover requested interval")
+            packet = int(np.searchsorted(offsets, start, side="right") - 1)
+            cursor = start
+            while cursor < stop:
+                end = min(stop, int(offsets[packet + 1]))
+                if end > cursor:
+                    address = int(entries[packet]["offset"]) + 2 * (
+                        cursor - int(offsets[packet])
+                    )
+                    tasks.append((address, end - cursor, column,
+                                  cursor - start, gain, offset))
+                cursor = end
+                packet += 1
+        with self.path.open("rb") as handle:
+            for address, size, column, destination, gain, offset in sorted(tasks):
+                handle.seek(address)
+                raw = np.fromfile(handle, dtype="<i2", count=size)
+                if len(raw) != size:
+                    raise EOFError("truncated channel packet: expected %d, read %d"
+                                   % (size, len(raw)))
+                out[destination:destination + size, column] = raw * gain + offset
+        return out
 
     def times(self, start_sec=0.0, duration_sec=None):
         """Ось времени в секундах для окна read() / read_channel()."""

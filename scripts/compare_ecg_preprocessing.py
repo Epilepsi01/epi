@@ -3,11 +3,15 @@
 Run from the project root: python -m scripts.compare_ecg_preprocessing
 The audit inventory and cached Neo snippets come from the preceding local audit.
 No patient names or source paths are exported. No model is trained.
+This historical filter/QC comparison is pinned to 2e4e0ea, before spike
+interpolation. The current default is checked by validate_ecg_spike_repair.
 """
 from pathlib import Path
 import importlib.util
 import json
 import sqlite3
+import subprocess
+import types
 
 import numpy as np
 import pandas as pd
@@ -16,14 +20,23 @@ from fractions import Fraction
 
 from epi import Catalog, WindowSet
 from epi.reader import NicoletEReader
-from epi.preprocessing import (
-    preprocess, preprocess_ecg, quality_report, ecg_quality_report,
-    line_noise_power_ratio,
-)
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIT = ROOT / "data/reports/no_valid_20261010"
 OUT = ROOT / "data/reports/preprocessing_v2_20261010"
+FILTER_ONLY_REF = "2e4e0eafa01bc1a9ee850d425f27c0ad4c5ea447"
+_filter_only = types.ModuleType("filter_only_preprocessing")
+_source = subprocess.run(
+    ["git", "show", f"{FILTER_ONLY_REF}:epi/preprocessing.py"], cwd=ROOT,
+    check=True, capture_output=True, text=True,
+).stdout
+exec(compile(_source, "filter_only_preprocessing", "exec"), _filter_only.__dict__)
+preprocess = _filter_only.preprocess
+preprocess_ecg = _filter_only.preprocess_ecg
+quality_report = _filter_only.quality_report
+ecg_quality_report = _filter_only.ecg_quality_report
+ecg_raw_quality_report = _filter_only.ecg_raw_quality_report
+line_noise_power_ratio = _filter_only.line_noise_power_ratio
 
 
 def resample(x, source_rate):

@@ -65,13 +65,21 @@ def main():
     manifest = pd.read_csv(OUT / "window_manifest.csv")
     train_meta = pd.concat([manifest[manifest.recording_id == rid].head(2)
                             for rid in [31, 44, 46, 14]]).to_dict("records")
+    # Exercise the actual repair path in the model cells, not only clean controls.
+    repaired_example = manifest[(manifest.recording_id == 14) &
+                                (manifest.segment == 0) & (manifest.start_sec == 3305)]
+    assert len(repaired_example) == 1
+    train_meta.extend(repaired_example.to_dict("records"))
     test_meta = pd.concat([manifest[manifest.recording_id == rid].head(2)
                            for rid in [202, 137]]).to_dict("records")
+    notebook_out = ROOT / "data/reports/ecg_spike_repair/notebook_validation"
+    notebook_out.mkdir(parents=True, exist_ok=True)
     with Catalog(":memory:") as catalog:
         with sqlite3.connect(f"file:{ROOT}/data/catalog.sqlite?mode=ro", uri=True) as source:
             source.backup(catalog.conn)
         windows = WindowSet(catalog, channels=["EKG"], length_sec=300, rate=256)
-        ns = dict(np=np, windows=windows, TARGET_RATE=256, BATCH=2, LOW=.5, HIGH=40,
+        ns = dict(np=np, pd=pd, OUT_DIR=notebook_out, windows=windows,
+                  TARGET_RATE=256, BATCH=2, LOW=.5, HIGH=40,
                   NOTCH=50, NORMALIZE_METHOD="robust", NORMALIZE_CLIP=None, ECG_SPEC=("EKG", "ECG"),
                   QC_FIXED=dict(max_flat=.01, max_clipping=.01, max_bad_channels=.25, max_nan=0),
                   QC_QUANTILE=.995, preprocess_ecg=preprocess_ecg, ecg_quality_report=ecg_quality_report,
@@ -95,6 +103,11 @@ def main():
         assert len(kept) > 0
         assert ns["dev_qc"]["keep"][kept].all()
         assert hashlib.sha256(ns["x_dev"].tobytes()).hexdigest() == digest
+        assert ns["x_dev_prepared"].shape == ns["x_dev"].shape
+        assert ns["dev_qc"]["repaired_fraction"].max() <= .01
+        assert ns["dev_qc"]["repair_applied"][-1]
+        assert ns["dev_qc"]["keep"][-1]
+        assert len(ns["dev_repairs"]) > 0
         assert ns["x_dev_filtered"].shape == ns["x_dev_robust"].shape == ns["x_dev"].shape
         assert np.isfinite(ns["x_dev_filtered"]).all() and np.isfinite(ns["x_dev_robust"]).all()
         # Singletons and batches must expose reasons/keep usable by the model cell.

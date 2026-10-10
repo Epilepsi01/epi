@@ -252,14 +252,168 @@ def preprocess(x, rate, low=0.5, high=40.0, notch_freq=50.0, normalize_signal=Fa
     return x
 
 
+def _mask_spans(mask):
+    """Полуоткрытые интервалы True, в индексах исходного массива."""
+    return np.flatnonzero(np.diff(np.r_[False, mask, False])).reshape(-1, 2)
+
+
+def repair_ecg_spikes(x, rate, *, adc_limits=None, min_peak_uv=1000.0,
+                      peak_ratio=8.0, edge_ratio=2.0, padding_sec=0.02,
+                      max_duration_sec=0.1, max_repaired_fraction=0.01,
+                      isolation_sec=1.0, neighbor_ratio=0.25):
+    """Заменить короткие одиночные выбросы ЭКГ ДО фильтрации/ресэмплинга.
+
+    Возвращает (копия сигнала, отчёт). Вход — физические мкВ, форма
+    (каналы, отсчёты) или (окна, каналы, отсчёты). Длина/время не меняются.
+    Вне report['repaired_mask'] значения остаются в точности исходными.
+
+    Кандидат: отклонение от медианы >1000 мкВ И >8 медиан секундных пиков.
+    Границы расширяются до edge_ratio типичных пиков и на padding_sec.
+    Если в соседней секунде есть пик >=25% высоты кандидата, он не считается
+    изолированным: не изменяется и проверяется обычным QC. Это предохраняет
+    серии высоких комплексов от интерполяции по глобальному порогу окна.
+    Линейная интерполяция разрешена только между двумя исходными опорами,
+    для интервалов <=100 мс, суммарно <=1% окна по каждому каналу.
+    При превышении бюджета весь канал остаётся без замен. Кандидаты на
+    границе, длинные повреждения, нечисловые опоры, насыщение АЦП и плато
+    на пике не восстанавливаются: они остаются в unrepaired_mask.
+
+    Маска обозначает искусственно заполненные отсчёты, а не восстановленную
+    ЭКГ. Пороги — проверяемые на своих данных инженерные эвристики. Это
+    специализированная обработка ЭКГ, её нельзя переносить на ЭЭГ-спайки.
+    ADC-пределы желательно передать из reader.channel_limits('EKG').
+    """
+    single = np.asarray(x).ndim == 2
+    raw = _array(x)
+    if single:
+        raw = raw[None]
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError("rate must be positive and finite")
+    for name, value in (("min_peak_uv", min_peak_uv), ("peak_ratio", peak_ratio),
+                        ("edge_ratio", edge_ratio), ("max_duration_sec", max_duration_sec),
+                        ("isolation_sec", isolation_sec)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be positive and finite")
+    if edge_ratio >= peak_ratio:
+        raise ValueError("edge_ratio must be less than peak_ratio")
+    if not np.isfinite(padding_sec) or padding_sec < 0:
+        raise ValueError("padding_sec must be nonnegative and finite")
+    if not np.isfinite(max_repaired_fraction) or not 0 <= max_repaired_fraction <= 1:
+        raise ValueError("max_repaired_fraction must be between 0 and 1")
+    if not np.isfinite(neighbor_ratio) or not 0 < neighbor_ratio <= 1:
+        raise ValueError("neighbor_ratio must be in (0, 1]")
+    if not raw.shape[1] or not raw.shape[2]:
+        raise ValueError("empty ECG signal")
+    bounds = None
+    if adc_limits is not None:
+        bounds = np.broadcast_to(np.asarray(adc_limits, dtype=float), (raw.shape[1], 2))
+        if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] >= bounds[:, 1]):
+            raise ValueError("adc_limits must have finite increasing bounds")
+
+    out = raw.copy()
+    detected = np.zeros(raw.shape, dtype=bool)
+    repaired = np.zeros(raw.shape, dtype=bool)
+    intervals = []
+    typical_uv = np.full(raw.shape[:2], np.nan)
+    block = max(1, int(round(rate)))
+    padding = int(np.ceil(padding_sec * rate))
+    neighborhood = int(np.ceil(isolation_sec * rate))
+    n = raw.shape[-1]
+    for wi, window in enumerate(raw):
+        for ci, ch in enumerate(window):
+            # Missing/nonfinite data are handled by raw QC, never interpolated.
+            if n < 2 * block or not np.all(np.isfinite(ch)):
+                continue
+            a = np.abs(ch - np.median(ch))
+            typical = float(np.median(a[:n // block * block].reshape(-1, block).max(axis=1)))
+            typical_uv[wi, ci] = typical
+            seed = a > max(min_peak_uv, peak_ratio * typical)
+            if not np.any(seed):
+                continue
+            # Hysteresis keeps the shoulder of an impulse, not just its top.
+            support = a > max(min_peak_uv / 4, edge_ratio * typical)
+            candidate = np.zeros(n, dtype=bool)
+            for start, stop in _mask_spans(support):
+                if np.any(seed[start:stop]):
+                    candidate[max(0, start - padding):min(n, stop + padding)] = True
+            isolated = np.zeros(n, dtype=bool)
+            for start, stop in _mask_spans(candidate):
+                peak = a[start:stop].max()
+                neighbor = max(a[max(0, start - neighborhood):start].max(initial=0),
+                               a[stop:min(n, stop + neighborhood)].max(initial=0))
+                if neighbor >= neighbor_ratio * peak:
+                    intervals.append(dict(window=int(wi), channel=int(ci),
+                                          start_sample=int(start), stop_sample=int(stop),
+                                          start_sec=float(start / rate), stop_sec=float(stop / rate),
+                                          repaired=False, reason="not_isolated"))
+                else:
+                    isolated[start:stop] = True
+            detected[wi, ci] = isolated
+            spans = _mask_spans(isolated)
+            budget_exceeded = isolated.mean() > max_repaired_fraction
+            for start, stop in spans:
+                reason = "interpolated"
+                if start == 0 or stop == n:
+                    reason = "window_edge"
+                elif budget_exceeded:
+                    reason = "repair_budget_exceeded"
+                elif (stop - start) / rate > max_duration_sec:
+                    reason = "too_long"
+                elif bounds is not None and np.any(
+                    (ch[start:stop] <= bounds[ci, 0] + 1e-6)
+                    | (ch[start:stop] >= bounds[ci, 1] - 1e-6)
+                ):
+                    reason = "adc_clipping"
+                else:
+                    # Three equal high samples also guard against saturation
+                    # when the caller does not have ADC calibration metadata.
+                    plateau = (np.abs(np.diff(ch[start:stop])) <= 1e-6)
+                    plateau &= seed[start:stop - 1] & seed[start + 1:stop]
+                    if _longest_run(plateau) >= 2:
+                        reason = "peak_plateau"
+                if reason == "interpolated":
+                    out[wi, ci, start:stop] = np.linspace(
+                        ch[start - 1], ch[stop], stop - start + 2
+                    )[1:-1]
+                    repaired[wi, ci, start:stop] = True
+                intervals.append(dict(window=int(wi), channel=int(ci),
+                                      start_sample=int(start), stop_sample=int(stop),
+                                      start_sec=float(start / rate), stop_sec=float(stop / rate),
+                                      repaired=reason == "interpolated", reason=reason))
+    intervals.sort(key=lambda row: (row["window"], row["channel"], row["start_sample"]))
+    unrepaired = detected & ~repaired
+    report = dict(
+        repaired_mask=repaired, detected_mask=detected, unrepaired_mask=unrepaired,
+        repaired_fraction=repaired.mean(axis=-1).max(axis=-1),
+        detected_fraction=detected.mean(axis=-1).max(axis=-1),
+        unrepaired_spike=unrepaired.any(axis=(1, 2)),
+        repair_applied=repaired.any(axis=(1, 2)), typical_peak_uv=typical_uv,
+        intervals=intervals,
+    )
+    if single:
+        out = out[0]
+        report = {name: (value if name == "intervals" else
+                         value[0].item() if isinstance(value[0], np.generic) else value[0])
+                  for name, value in report.items()}
+    return out, report
+
+
 def preprocess_ecg(x, rate, low=0.5, high=40.0, notch_freq=50.0,
                    normalize_signal=False, normalize_method="robust", clip=None,
-                   notch_width=4.0, pad_sec=2.0):
-    """ЭКГ: полосовое подавление сети, затем 0.5–40 Гц; результат float32.
+                   notch_width=4.0, pad_sec=2.0, repair_spikes=True,
+                   spike_options=None, adc_limits=None, return_info=False):
+    """ЭКГ: короткие выбросы → подавление сети → 0.5–40 Гц; float32.
 
-    В отличие от узкого notch в preprocess(), по умолчанию подавляется полоса
-    48–52 Гц: частота помехи может отклоняться от 50 Гц. Отражение краёв снижает
-    переходные процессы; никакие отсчёты не удаляются. Фильтры двунаправленные,
+    По умолчанию repair_ecg_spikes() интерполирует короткие одиночные выбросы
+    до частотных фильтров. repair_spikes=False возвращает режим без замен.
+    spike_options — параметры repair_ecg_spikes; return_info=True возвращает
+    (signal, repair_report) с маской и границами замен (None при отключении).
+    Сохраняйте этот отчёт:
+    интерполяция не восстанавливает истинную ЭКГ внутри повреждения.
+    Длинные/неустранимые дефекты остаются, их необходимо отклонять по QC.
+
+    Подавляется полоса 48–52 Гц, затем частоты вне 0.5–40 Гц. Отражение краёв
+    снижает переходные процессы; длина сигнала не меняется. Фильтры двунаправленные,
     поэтому это офлайн-обработка целого окна, не потоковый causal-фильтр.
     QC делайте по исходному сигналу И результату до нормализации: фильтрация
     не восстанавливает клиппинг или пропуски. notch_freq=None отключает сеть.
@@ -271,6 +425,9 @@ def preprocess_ecg(x, rate, low=0.5, high=40.0, notch_freq=50.0,
         raise ValueError("pad_sec must be nonnegative and finite")
     if not np.isfinite(notch_width) or notch_width <= 0:
         raise ValueError("notch_width must be positive and finite")
+    info = None
+    if repair_spikes:
+        x, info = repair_ecg_spikes(x, rate, adc_limits=adc_limits, **(spike_options or {}))
     padding = min(int(round(pad_sec * rate)), x.shape[-1] - 1)
     if padding < 0:
         raise ValueError("empty signal")
@@ -290,7 +447,8 @@ def preprocess_ecg(x, rate, low=0.5, high=40.0, notch_freq=50.0,
         out = out[..., padding:-padding]
     if normalize_signal:
         out = normalize(out, method=normalize_method, clip=clip)
-    return out.astype(np.float32)
+    out = out.astype(np.float32)
+    return (out, info) if return_info else out
 
 
 def line_noise_power_ratio(x, rate, line_freq=50.0, half_width=2.0,
@@ -387,14 +545,21 @@ def ecg_raw_quality_report(raw, rate, adc_limits=None, max_constant_sec=0.5, **l
 
 def ecg_quality_report(raw, rate, filtered=None, adc_limits=None,
                        max_constant_sec=0.5, max_peak_ratio=8.0,
-                       min_peak_uv=1000.0, max_line_noise=0.01, **limits):
+                       min_peak_uv=1000.0, max_line_noise=0.01,
+                       repair_spikes=True, spike_options=None, **limits):
     """Консервативный QC ЭКГ до нормализации, без изменения входных отсчётов.
 
     raw — физические мкВ до фильтрации (лучше до ресэмплинга).
     adc_limits — (нижний, верхний) или (каналы, 2) из reader.channel_limits().
     filtered — те же окна, в мкВ, с той же частотой и формой; None вызывает
-    preprocess_ecg(). Пропуски/клиппинг проверяются по raw, остаточная сеть и
-    одиночные выбросы — по filtered. Окно исключается целиком, без интерполяции.
+    preprocess_ecg(), по умолчанию с предварительной заменой коротких выбросов.
+    Пропуски/клиппинг проверяются по неизменённому raw, остаточная сеть и
+    одиночные выбросы — по filtered. Длинные/граничные выбросы и превышение
+    бюджета замен всегда отклоняются по raw, даже если фильтр их сгладил.
+    repair_spikes управляет обработкой, когда filtered=None. При готовом
+    filtered отчёт не меняет его и не утверждает, что замены были выполнены:
+    repairable_fraction — лишь доля raw, подходящая для интерполяции.
+    Фактическую маску замен возвращает preprocess_ecg(return_info=True).
 
     Выброс: пик > min_peak_uv И > max_peak_ratio медианы секундных пиков.
     Регулярные высокие R-зубцы сами по себе не являются причиной отбраковки.
@@ -403,8 +568,11 @@ def ecg_quality_report(raw, rate, filtered=None, adc_limits=None,
     """
     single = np.asarray(raw).ndim == 2
     raw = _array(raw)
+    repaired, spike_info = repair_ecg_spikes(
+        raw, rate, adc_limits=adc_limits, **(spike_options or {})
+    )
     if filtered is None:
-        filtered = preprocess_ecg(raw, rate)
+        filtered = preprocess_ecg(repaired if repair_spikes else raw, rate, repair_spikes=False)
     filtered = _array(filtered)
     if filtered.shape != raw.shape:
         raise ValueError("raw and filtered must have the same shape")
@@ -427,10 +595,12 @@ def ecg_quality_report(raw, rate, filtered=None, adc_limits=None,
     residual = line_noise_power_ratio(filtered, rate, trim_sec=trim)
     flags = {
         "isolated_spike": np.any((peaks > min_peak_uv) & (peak_ratio > max_peak_ratio), axis=1),
+        "unrepairable_spike": np.atleast_1d(spike_info["unrepaired_spike"]),
         "residual_line_noise": residual > max_line_noise,
         "nonfinite_filtered": ~np.all(np.isfinite(filtered), axis=(1, 2)),
     }
     report.update(peak_uv=peaks.max(axis=1), peak_ratio=peak_ratio.max(axis=1),
-                  residual_line_noise=residual)
+                  residual_line_noise=residual,
+                  repairable_fraction=np.atleast_1d(spike_info["repaired_fraction"]))
     report = _ecg_flags(report, flags)
     return _single_report(report) if single else report
